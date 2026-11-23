@@ -1,4 +1,4 @@
-import type { Activity, Category, Filters } from "./types.js";
+import { LOCATIONS, MOODS, type Activity, type Category, type Filters } from "./types.js";
 
 export const SCORING = {
   mood: 3,
@@ -25,9 +25,39 @@ export type RecommendationResult =
  * Проверь участников (1–10), время (>0), бюджет (>=0), место и настроение.
  * null и "any" означают отсутствие соответствующего ограничения.
  */
-export function validateFilters(_filters: Filters): string[] {
-  // TODO: начни с этого
-  return [];
+export function validateFilters(filters: Filters): string[] {
+  const errors: string[] = [];
+
+  if (
+    filters.participants !== null &&
+    (!Number.isInteger(filters.participants) || filters.participants < 1 || filters.participants > 10)
+  ) {
+    errors.push("Количество участников должно быть целым числом от 1 до 10");
+  }
+
+  if (
+    filters.availableMinutes !== null &&
+    (!Number.isFinite(filters.availableMinutes) || filters.availableMinutes <= 0)
+  ) {
+    errors.push("Время должно быть конечным числом больше 0");
+  }
+
+  if (
+    filters.budgetPerPerson !== null &&
+    (!Number.isFinite(filters.budgetPerPerson) || filters.budgetPerPerson < 0)
+  ) {
+    errors.push("Бюджет должен быть конечным числом не меньше 0");
+  }
+
+  if (filters.location !== "any" && !LOCATIONS.includes(filters.location)) {
+    errors.push("Указано неизвестное место");
+  }
+
+  if (filters.mood !== "any" && !MOODS.includes(filters.mood)) {
+    errors.push("Указано неизвестное настроение");
+  }
+
+  return errors;
 }
 
 /**
@@ -35,9 +65,19 @@ export function validateFilters(_filters: Filters): string[] {
  * Ошибочные фильтры должны давать пустой массив.
  * Не изменяй исходный каталог.
  */
-export function filterActivities(activities: readonly Activity[], _filters: Filters): Activity[] {
-  // TODO: этот временный вариант НЕ фильтрует
-  return [...activities];
+export function filterActivities(activities: readonly Activity[], filters: Filters): Activity[] {
+  if (validateFilters(filters).length > 0) {
+    return [];
+  }
+
+  return activities.filter(activity =>
+    activity.isActive &&
+    (filters.participants === null ||
+      (activity.minParticipants <= filters.participants && activity.maxParticipants >= filters.participants)) &&
+    (filters.availableMinutes === null || activity.durationMinutes <= filters.availableMinutes) &&
+    (filters.budgetPerPerson === null || activity.estimatedCostPerPerson <= filters.budgetPerPerson) &&
+    (filters.location === "any" || activity.locations.includes(filters.location)),
+  );
 }
 
 /**
@@ -47,12 +87,46 @@ export function filterActivities(activities: readonly Activity[], _filters: Filt
  */
 export function rankActivities(
   activities: readonly Activity[],
-  _filters: Filters,
-  _interests: readonly Category[],
-  _preferredTags: readonly string[] = [],
+  filters: Filters,
+  interests: readonly Category[],
+  preferredTags: readonly string[] = [],
 ): RankedActivity[] {
-  // TODO: оценки пока фиктивные
-  return activities.map(activity => ({ activity, score: 0, reasons: ["Пока без объяснения"] }));
+  return activities.map(activity => {
+    let score = 0;
+    const reasons: string[] = [];
+
+    if (filters.mood !== "any" && activity.moods.includes(filters.mood)) {
+      score += SCORING.mood;
+      reasons.push("Подходит по настроению");
+    }
+
+    if (interests.includes(activity.category)) {
+      score += SCORING.interest;
+      reasons.push("Совпадает с интересами");
+    }
+
+    if (activity.tags.some(tag => preferredTags.includes(tag))) {
+      score += SCORING.tag;
+      reasons.push("Есть предпочтительный тег");
+    }
+
+    if (
+      filters.availableMinutes !== null &&
+      activity.durationMinutes <= filters.availableMinutes &&
+      filters.availableMinutes - activity.durationMinutes <= SCORING.timeFitWindowMinutes
+    ) {
+      score += SCORING.timeFit;
+      reasons.push("Укладывается в доступное время с небольшим запасом");
+    }
+
+    if (reasons.length === 0) {
+      reasons.push("Новая идея для компании");
+    }
+
+    return { activity, score, reasons };
+  }).sort(
+    (left, right) => right.score - left.score || left.activity.id.localeCompare(right.activity.id),
+  );
 }
 
 /**
@@ -64,13 +138,50 @@ export function rankActivities(
  * preferredTags передай в rankActivities (не потеряй аргумент).
  */
 export function recommend(
-  _activities: readonly Activity[],
-  _filters: Filters,
-  _interests: readonly Category[],
-  _shownIds: readonly string[] = [],
-  _random: () => number = Math.random,
-  _preferredTags: readonly string[] = [],
+  activities: readonly Activity[],
+  filters: Filters,
+  interests: readonly Category[],
+  shownIds: readonly string[] = [],
+  random: () => number = Math.random,
+  preferredTags: readonly string[] = [],
 ): RecommendationResult {
-  // TODO: замени заглушку своим алгоритмом
-  return { kind: "empty", eligibleCount: 0 };
+  const errors = validateFilters(filters);
+  if (errors.length > 0) {
+    return { kind: "invalid", errors };
+  }
+
+  const eligible = filterActivities(activities, filters);
+  if (eligible.length === 0) {
+    return { kind: "empty", eligibleCount: 0 };
+  }
+
+  const shown = new Set(shownIds);
+  const remaining = eligible.filter(activity => !shown.has(activity.id));
+  if (remaining.length === 0) {
+    return { kind: "exhausted", eligibleCount: eligible.length };
+  }
+
+  const ranked = rankActivities(remaining, filters, interests, preferredTags);
+  const hasNoConstraints =
+    filters.participants === null &&
+    filters.availableMinutes === null &&
+    filters.budgetPerPerson === null &&
+    filters.location === "any" &&
+    filters.mood === "any";
+  const hasNoPreferences = interests.length === 0 && preferredTags.length === 0;
+  const candidates = hasNoConstraints && hasNoPreferences
+    ? ranked
+    : ranked.slice(0, SCORING.candidateLimit);
+  const randomValue = random();
+  const index = Number.isFinite(randomValue)
+    ? Math.min(candidates.length - 1, Math.max(0, Math.floor(randomValue * candidates.length)))
+    : 0;
+  const recommendation = candidates[index];
+
+  return {
+    kind: "success",
+    recommendation,
+    eligibleCount: eligible.length,
+    remainingCount: remaining.length - 1,
+  };
 }
